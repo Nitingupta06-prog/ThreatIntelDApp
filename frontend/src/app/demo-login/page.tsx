@@ -11,6 +11,7 @@ type LoginResult = {
   invalidCredentials?: boolean;
   locked?: boolean;
   restricted?: boolean;
+  blockedByIntel?: boolean;
   reason?: string;
   username?: string;
   attemptCount?: number;
@@ -104,7 +105,7 @@ export default function DemoLoginPage() {
 
   const resultKind = result?.authenticated
     ? "allowed"
-    : result?.locked || result?.restricted
+    : result?.locked || result?.restricted || result?.blockedByIntel
       ? "restricted"
       : result?.invalidCredentials
         ? "error"
@@ -223,11 +224,13 @@ export default function DemoLoginPage() {
                 <h2>
                   {result.authenticated
                     ? "Login successful"
-                    : result.locked
-                      ? "Account locked"
-                      : result.restricted
-                        ? `Restriction level ${result.restriction?.level ?? ""} active`
-                        : "Invalid credentials"}
+                    : result.blockedByIntel
+                      ? "Blocked by verified threat intel"
+                      : result.locked
+                        ? "Account locked"
+                        : result.restricted
+                          ? `Restriction level ${result.restriction?.level ?? ""} active`
+                          : "Invalid credentials"}
                 </h2>
                 <p>{result.reason}</p>
                 {typeof result.attemptCount === "number" && typeof result.threshold === "number" && typeof result.windowMinutes === "number" && (

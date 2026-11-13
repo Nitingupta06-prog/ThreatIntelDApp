@@ -94,6 +94,12 @@ const port = Number(process.env.PORT) || 3001;
 
 const KUBO_API_URL = (process.env.KUBO_API_URL || "http://127.0.0.1:5001").replace(/\/+$/, "");
 const KUBO_ORIGIN = "http://127.0.0.1:5001";
+const KUBO_GATEWAY_URL = (process.env.KUBO_GATEWAY_URL || "http://127.0.0.1:8080").replace(/\/+$/, "");
+const V2_REGISTRY_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+const V2_CHAIN_RPC_URL = (process.env.V2_CHAIN_RPC_URL || "http://127.0.0.1:8545").replace(/\/+$/, "");
+const V2_REPORT_COUNT_SELECTOR = "0x185c6f84";
+const V2_GET_REPORT_SELECTOR = "0x4e7f9b19";
+const V2_STATUS_VERIFIED = 1;
 
 const trustProxy = process.env.TRUST_PROXY?.trim();
 if (trustProxy) {
@@ -361,6 +367,114 @@ app.post("/api/ipfs/add-report", async (request, response) => {
     response.status(201).json({ cid });
   } catch {
     response.status(502).json({ error: "IPFS storage returned an invalid response." });
+  }
+});
+
+async function ethCallV2Registry(data: string): Promise<string> {
+  const rpcResponse = await fetch(V2_CHAIN_RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "eth_call",
+      params: [{ to: V2_REGISTRY_ADDRESS, data }, "latest"],
+    }),
+  });
+  const payload = (await rpcResponse.json()) as { result?: unknown };
+  if (!rpcResponse.ok || typeof payload.result !== "string" || !payload.result.startsWith("0x")) {
+    throw new Error("Registry RPC call failed.");
+  }
+  return payload.result;
+}
+
+function decodeV2ReportResult(hexData: string) {
+  const data = hexData.startsWith("0x") ? hexData.slice(2) : hexData;
+  const readWord = (index: number) => {
+    const value = data.slice(index * 64, (index + 1) * 64);
+    if (value.length !== 64) throw new Error("Invalid report data from registry.");
+    return BigInt(`0x${value}`);
+  };
+
+  // getReport returns one dynamic tuple (Report), so the return data starts
+  // with an offset to the tuple before the tuple's own fields.
+  const tupleOffsetBytes = Number(readWord(0));
+  if (!Number.isSafeInteger(tupleOffsetBytes) || tupleOffsetBytes % 32 !== 0) {
+    throw new Error("Invalid report tuple offset.");
+  }
+  const tupleStartWord = tupleOffsetBytes / 32;
+  const cidOffsetBytes = Number(readWord(tupleStartWord));
+  if (!Number.isSafeInteger(cidOffsetBytes) || cidOffsetBytes % 32 !== 0) {
+    throw new Error("Invalid report CID offset.");
+  }
+
+  const submitter = `0x${readWord(tupleStartWord + 1).toString(16).padStart(64, "0").slice(-40)}`;
+  const submittedAt = readWord(tupleStartWord + 2);
+  const status = Number(readWord(tupleStartWord + 3));
+  const cidLengthWord = tupleStartWord + cidOffsetBytes / 32;
+  const stringLength = Number(readWord(cidLengthWord));
+  if (!Number.isSafeInteger(stringLength) || stringLength < 0) {
+    throw new Error("Invalid report CID length.");
+  }
+  const cidStart = (cidLengthWord + 1) * 64;
+  const cidHex = data.slice(cidStart, cidStart + stringLength * 2);
+  if (cidHex.length !== stringLength * 2) throw new Error("Incomplete report CID data.");
+  const ipfsCid = Buffer.from(cidHex, "hex").toString("utf8");
+  return { ipfsCid, submitter, submittedAt, status };
+}
+
+function normalizeIp(value: string): string {
+  let ip = value.trim().toLowerCase();
+  if (ip.startsWith("[")) ip = ip.slice(1);
+  const closingBracket = ip.indexOf("]");
+  if (closingBracket !== -1) ip = ip.slice(0, closingBracket);
+  if (ip.startsWith("::ffff:")) {
+    const mapped = ip.slice("::ffff:".length);
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(mapped)) ip = mapped;
+  }
+  return ip;
+}
+
+async function fetchVerifiedIntelReports(): Promise<Array<Record<string, unknown>>> {
+  const countHex = await ethCallV2Registry(V2_REPORT_COUNT_SELECTOR);
+  const count = Number(BigInt(countHex));
+  const verified: Array<Record<string, unknown>> = [];
+
+  for (let reportId = 0; reportId < count; reportId += 1) {
+    const callData = `${V2_GET_REPORT_SELECTOR}${reportId.toString(16).padStart(64, "0")}`;
+    const raw = await ethCallV2Registry(callData);
+    const report = decodeV2ReportResult(raw);
+    if (report.status !== V2_STATUS_VERIFIED) continue;
+
+    let ipfs: Record<string, unknown> = {};
+    try {
+      const ipfsResponse = await fetch(`${KUBO_GATEWAY_URL}/ipfs/${report.ipfsCid}`);
+      if (ipfsResponse.ok) {
+        ipfs = (await ipfsResponse.json()) as Record<string, unknown>;
+      }
+    } catch {
+      // Keep the on-chain fields even if IPFS content is unavailable.
+    }
+
+    verified.push({
+      ipAddress: typeof ipfs.ipAddress === "string" ? ipfs.ipAddress : null,
+      threatType: typeof ipfs.threatType === "string" ? ipfs.threatType : null,
+      summary: typeof ipfs.summary === "string" ? ipfs.summary : null,
+      cid: report.ipfsCid,
+      status: "Verified",
+      submittedAt: new Date(Number(report.submittedAt) * 1000).toISOString(),
+    });
+  }
+
+  return verified;
+}
+
+app.get("/api/intel/verified", async (_request, response) => {
+  try {
+    const verified = await fetchVerifiedIntelReports();
+    response.json({ reports: verified, total: verified.length });
+  } catch {
+    response.status(502).json({ error: "Verified intel feed is unavailable." });
   }
 });
 
@@ -727,6 +841,30 @@ app.post("/api/login", async (request, response) => {
           expiresAt: activeRestriction.expiresAt,
           incidentHash: activeRestriction.incidentHash,
         },
+      });
+      return;
+    }
+
+    let verifiedIntelIps: Set<string>;
+    try {
+      const verifiedReports = await fetchVerifiedIntelReports();
+      verifiedIntelIps = new Set(
+        verifiedReports
+          .map((report) => (typeof report.ipAddress === "string" ? normalizeIp(report.ipAddress) : ""))
+          .filter((ip) => ip.length > 0)
+      );
+    } catch {
+      response.status(503).json({ error: "Verified threat-intel feed is unavailable; login cannot be evaluated." });
+      return;
+    }
+
+    if (verifiedIntelIps.has(normalizeIp(ipAddress))) {
+      response.status(403).json({
+        allowed: false,
+        authenticated: false,
+        blockedByIntel: true,
+        reason: "This address matches a verified threat-intelligence report. Login is denied by the verified intel feed for this demo app.",
+        username,
       });
       return;
     }
