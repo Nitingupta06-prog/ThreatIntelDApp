@@ -92,6 +92,9 @@ const LOGIN_RESTRICTION_DURATIONS: Record<1 | 2, number> = { 1: 30, 2: 48 * 60 }
 const app = express();
 const port = Number(process.env.PORT) || 3001;
 
+const KUBO_API_URL = (process.env.KUBO_API_URL || "http://127.0.0.1:5001").replace(/\/+$/, "");
+const KUBO_ORIGIN = "http://127.0.0.1:5001";
+
 const trustProxy = process.env.TRUST_PROXY?.trim();
 if (trustProxy) {
   app.set("trust proxy", trustProxy === "true" ? true : /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
@@ -312,6 +315,52 @@ app.post("/api/reports", async (request, response) => {
     response.status(201).json({ report: { ...report, _id: result.insertedId } });
   } catch {
     response.status(500).json({ error: "Unable to save the threat report." });
+  }
+});
+
+app.post("/api/ipfs/add-report", async (request, response) => {
+  const body: unknown = request.body;
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    response.status(400).json({ error: "Request body must be a JSON object." });
+    return;
+  }
+
+  const reportJson = JSON.stringify(body);
+  const formData = new FormData();
+  formData.append("file", new Blob([reportJson], { type: "application/json" }), "report.json");
+
+  let kuboResponse: Response;
+  try {
+    kuboResponse = await fetch(`${KUBO_API_URL}/api/v0/add?pin=true`, {
+      method: "POST",
+      headers: { Origin: KUBO_ORIGIN },
+      body: formData,
+    });
+  } catch {
+    response.status(502).json({ error: "IPFS storage is unavailable." });
+    return;
+  }
+
+  if (!kuboResponse.ok) {
+    response.status(502).json({ error: "IPFS storage rejected the report." });
+    return;
+  }
+
+  try {
+    const result: unknown = await kuboResponse.json();
+    const cid =
+      typeof result === "object" && result !== null
+        ? (result as Record<string, unknown>).Hash
+        : undefined;
+
+    if (typeof cid !== "string" || cid.length === 0) {
+      response.status(502).json({ error: "IPFS storage returned an invalid response." });
+      return;
+    }
+
+    response.status(201).json({ cid });
+  } catch {
+    response.status(502).json({ error: "IPFS storage returned an invalid response." });
   }
 });
 

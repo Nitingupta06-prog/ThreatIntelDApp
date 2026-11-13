@@ -1,192 +1,111 @@
 # ThreatIntelDApp
 
-A beginner-friendly decentralized threat-intelligence demo. Analysts submit threat reports off-chain; the dashboard can anchor a deterministic hash of each report on an Ethereum smart contract and track an on-chain audit status.
+A classroom prototype for decentralized threat-intelligence reporting and community review.
 
-## What the app does (and its demo boundaries)
+## Class-demo scope
 
-- **Off-chain reports** — the backend stores threat reports (IP address, threat type, summary, optional evidence) in MongoDB. Reports stay `pending_review`.
-- **Alerts are a heuristic, not live monitoring** — alerts are generated locally from two rules: submitted-report bursts (3+ reports for the same IP within 10 minutes) and failed demo login bursts (4+ failed logins for the same account and server-observed IP within 10 minutes). No real network traffic is analyzed.
-- **Demo login is a real credential check for this app only** — `POST /api/login` verifies username/password against `DEMO_LOGIN_USERNAME`/`DEMO_LOGIN_PASSWORD` in `backend/.env` (never hardcoded, logged, or returned). Failed attempts are recorded with server timestamp and server-observed client IP (proxy headers only when `TRUST_PROXY` is set). 4 failures in 10 minutes → 30-minute restriction; repeat after expiry → 48 hours; third escalation → account locked until admin unlock. Successful logins are not counted as failures.
-- **IP restrictions are demo-only and mostly automatic** — login restrictions only affect this app's `/api/login` endpoint — they do not block real logins or network traffic elsewhere. Only a non-sensitive incident hash (rule, level, threshold, window, timestamp — never username, password, or IP) can be anchored on-chain. Manual restrictions remain as an optional demo control.
-- **Login security admin access is a local demo control** — `GET /api/login-security` and `POST /api/login-security/unlock` require a short-lived admin session. Admin credentials come only from `DEMO_ADMIN_USERNAME`/`DEMO_ADMIN_PASSWORD` in `backend/.env`; `POST /api/admin/login` issues a random token in an HttpOnly, SameSite=Lax cookie (lifetime set by `ADMIN_SESSION_MINUTES`, default 30). No admin password or permanent secret exists in frontend code — the dashboard only holds the session cookie.
-- **On-chain registry** — `ThreatReportRegistry` stores the `bytes32` report hash, the submission timestamp, the submitter wallet address, and an audit status (`Submitted`, `UnderReview`, `Verified`, `Rejected`) for each report. No report text, IPs, or evidence go on-chain. The contract admin can update audit statuses; everyone can read them.
+The working demonstration is **local**: the report content is uploaded to the presenter’s IPFS node, and its CID plus reviewer decision are recorded on a local Hardhat blockchain. Three configured reviewer wallets vote; two matching votes make a report `Verified` or `Rejected`.
+
+This prototype does **not** monitor live network traffic, determine maliciousness automatically, or block IP addresses on other websites. A separate service would need to read the verified reports and decide what action to take. Use synthetic data only: IPFS report content is public to anyone who can retrieve its CID.
 
 ## Architecture
 
-| Layer | Tech | Role |
-| --- | --- | --- |
-| `frontend/` | Next.js 16 + React 19 + ethers v6 | Dashboard UI, MetaMask wallet connection, on-chain reads and transactions |
-| `backend/` | Express 5 + MongoDB (Node/tsx) | REST API for reports, alerts, demo restrictions, demo login |
-| `blockchain/` | Hardhat 3 + Solidity 0.8.34 + Ignition | `ThreatReportRegistry` contract storing report hash, submission timestamp, submitter wallet address, and audit status; report text, IP address, and evidence stay off-chain |
+| Part | Role in the demo |
+| --- | --- |
+| Next.js frontend | Submit a report and show IPFS and on-chain results |
+| Express backend | Sends the report JSON to the local Kubo IPFS node and returns its CID |
+| IPFS Desktop / Kubo | Stores and serves the report content by CID |
+| Hardhat + `ThreatReportRegistryV2` | Records each CID and its submitter, timestamp, and 2-of-3 review status |
+| MetaMask | Signs local-chain submission and reviewer-vote transactions |
 
-The frontend talks to the backend at `http://localhost:3001` and to the chain through the user's MetaMask wallet (it never holds a private key).
+The V2 contract address used by the current local demo is `0x5FbDB2315678afecb367f032d93F642f64180aa3` on chain `31337`.
 
-## Prerequisites
+## Start the classroom demo
 
-- Node.js 22.13+ and npm
-- MongoDB — a local instance or a MongoDB Atlas cluster
-- [MetaMask](https://metamask.io/) browser extension
-- For Sepolia work: a Sepolia testnet wallet with test ETH (see below)
+Before class, confirm IPFS Desktop is open and shows **Connected to IPFS**. The backend also needs the already-configured `backend/.env` and a reachable MongoDB connection to start; keep that private file out of screenshots and Git.
 
-## Install dependencies
-
-Run each command in its own PowerShell terminal, or sequentially:
+Open four PowerShell terminals. In each terminal, first activate the project’s Node version:
 
 ```powershell
-cd backend;   npm install
-cd ..\frontend; npm install
-cd ..\blockchain; npm install
+fnm env --use-on-cd --shell powershell | Out-String | Invoke-Expression
+fnm use 26
 ```
 
-## Configure the backend
-
-Copy the example env file and fill in your MongoDB connection string:
+**Terminal 1 — local blockchain:**
 
 ```powershell
-cd backend
-copy .env.example .env
-```
-
-`.env` should contain (values are yours — never commit them):
-
-```dotenv
-MONGODB_URI=mongodb://localhost:27017
-MONGODB_DB_NAME=threatintel_demo
-DEMO_LOGIN_USERNAME=demo_analyst
-DEMO_LOGIN_PASSWORD=choose-a-local-demo-password
-DEMO_ADMIN_USERNAME=demo_admin
-DEMO_ADMIN_PASSWORD=choose-a-local-admin-password
-# ADMIN_SESSION_MINUTES=30   # optional — admin session lifetime (default 30)
-# TRUST_PROXY=   # optional — only set when behind a trusted proxy
-```
-
-For Atlas, use your cluster's connection string instead. The database name defaults to `threatintel_demo`.
-
-## Run the app locally
-
-You need the Hardhat node running in one terminal at all times. A second terminal is used once for the deploy command and can then be reused for the backend. The frontend runs in a third terminal.
-
-**Terminal 1 — Hardhat local node** (chain ID `31337`, RPC `http://127.0.0.1:8545`):
-
-```powershell
-cd blockchain
+cd C:\Users\gupta\OneDrive\Documents\ThreatIntelDApp\blockchain
 npx hardhat node
 ```
 
-Leave it running — this is the persistent local node at `http://127.0.0.1:8545`. In a second terminal, deploy the registry to it, passing the existing admin parameter file:
+Leave it running. It prints local test accounts and private keys. Never use these generated test keys on Sepolia or Mainnet; never share them.
+
+**Terminal 2 — deploy V2 to that running node:**
 
 ```powershell
-cd blockchain
-npx hardhat ignition deploy ignition/modules/ThreatReportRegistry.ts --network localhost --parameters ignition/params/31337.json
+cd C:\Users\gupta\OneDrive\Documents\ThreatIntelDApp\blockchain
+npx hardhat ignition deploy ignition/modules/ThreatReportRegistryV2.ts --network localhost --parameters ignition/params/31337-v2.json
 ```
 
-This deploys to the running localhost node and uses `ignition/params/31337.json`, which transfers admin to the configured `adminAddress`. Once the deploy finishes, keep this same terminal open — you will reuse it for the backend below. The current local registry address is:
+Keep the node running. Restarting it resets the local chain state and demo transactions; redeploy V2 before presenting again.
 
-```
-0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0
-```
-
-(An older local deployment exists at `0x5FbDB2315678afecb367f032d93F642f64180aa3` — use the address above, which matches the frontend config.)
-
-**Terminal 2 — Deploy, then Backend (reuse the same terminal):**
-
-First run the deploy command shown above in this terminal. After it completes, start the backend in the same terminal:
+**Terminal 3 — backend:**
 
 ```powershell
-cd ..\backend
+cd C:\Users\gupta\OneDrive\Documents\ThreatIntelDApp\backend
 npm run dev
 ```
 
-Listens on `http://localhost:3001`. Health check: `http://localhost:3001/health`.
+Wait for `MongoDB connection established.` and `Backend server listening on port 3001`.
 
-**Terminal 3 — Frontend:**
+**Terminal 4 — frontend:**
 
 ```powershell
-cd frontend
+cd C:\Users\gupta\OneDrive\Documents\ThreatIntelDApp\frontend
 npm run dev
 ```
 
 Open `http://localhost:3000`.
 
-## Using the dashboard
+## Demo sequence
 
-1. Submit threat reports with **Submit Report** (stored off-chain in MongoDB).
-2. Click **Connect Wallet** in the top bar and approve the MetaMask connection.
-3. In the **On-chain registry** section, pick **Hardhat Local** or **Sepolia**. If MetaMask is on the wrong network, use the switcher — the app will ask MetaMask to switch or add the network.
-4. The card shows `reportCount()` for the connected registry.
-5. In the reports table, click **Anchor hash** on a report. The app computes a deterministic `keccak256` hash of the report, checks `ReportSubmitted` events for duplicates (in 9,000-block chunks to respect RPC limits), and sends `submitReport` via MetaMask. Anchored reports show `Anchored · #id` plus a truncated tx hash, and the status persists after refresh.
-6. If your wallet is the contract admin, an audit-status dropdown appears for anchored reports; choosing a status sends `updateAuditStatus`. Non-admin wallets see the status read-only.
+1. In MetaMask, select **Hardhat Local** (RPC `http://127.0.0.1:8545`, chain ID `31337`). Connect the non-reviewer submitter wallet. It needs local test ETH for gas.
+2. Open **Submit Report** and enter synthetic data, for example:
 
-## Sepolia testnet
+   - IP: `192.0.2.10` (documentation-only test IP)
+   - Threat type: `Port scanning`
+   - Summary: `Synthetic class demonstration report`
 
-- **Chain ID:** `11155111`
-- **RPC used by the frontend:** `https://ethereum-sepolia-rpc.publicnode.com`
-- **Registry address:** `0xEdAC7D121D5bacA455735CF8c7C309D243B9B1a8`
-- **Deployment block:** `12069456` (the frontend only queries events from this block onward)
-- **Explorer:** `https://sepolia.etherscan.io`
+3. Choose **Decentralized submit (IPFS + local chain)** and confirm the MetaMask transaction. Explain: the report JSON goes to IPFS; the contract receives only its CID.
+4. Scroll to **Decentralized reports**. Show the report details loaded back from IPFS and its on-chain `Submitted` status.
+5. Switch MetaMask to reviewer A, connect that account to the dashboard, and click **Approve**. Show `1 approve`.
+6. Switch to a different reviewer account and approve the same report. Show the status change to **Verified**.
+7. Refresh the page and show that **Verified** remains. This was manually demonstrated on the local chain.
 
-### Get test ETH
+The local reviewers are the three addresses in `blockchain/ignition/params/31337-v2.json`. For this local-only demo, their private keys are printed by the Hardhat node and can be imported into MetaMask on the presenter’s computer. Do not paste those keys into this README, chat, slides, or use them on a public network. The report submitter must be a different wallet from the reviewers.
 
-Use a Sepolia faucet (e.g. Google "Sepolia faucet" — Alchemy, Infura, or sepoliafaucet.com) and paste your MetaMask account address.
+## Short presentation script
 
-### Deploying to Sepolia
+**English:** “ThreatIntelDApp is a prototype for sharing and reviewing threat reports. Report details are stored on IPFS, while the blockchain stores the content identifier and the review result. Three designated reviewers vote, and two matching votes are required to mark a report verified or rejected. This local demo does not monitor live traffic or block other systems; it demonstrates how applications could share and verify threat intelligence.”
 
-`hardhat.config.ts` reads two **configuration variables** for the `sepolia` network:
+**Hinglish:** “ThreatIntelDApp threat reports ko share aur review karne ka prototype hai. Report ki details IPFS par rehti hain, aur blockchain par uska CID aur review result record hota hai. Teen reviewers mein se do same decision dein tab report Verified ya Rejected hoti hai. Yeh local demo live traffic monitor ya kisi doosri app ko block nahi karta—yeh dikhata hai ki apps verified threat intelligence kaise share kar sakti hain.”
 
-- `SEPOLIA_RPC_URL` — your Sepolia RPC endpoint
-- `SEPOLIA_PRIVATE_KEY` — the deployer wallet's private key
+## Common questions
 
-These are stored in Hardhat's **encrypted keystore**, not in `.env` files. Set them interactively (Hardhat prompts for the value and encrypts it at rest):
+- **Why use IPFS?** It stores the report outside the contract and gives the content a CID. The CID lets the app retrieve the same content; it is not encryption or a privacy guarantee.
+- **Why use a blockchain?** It provides a shared, tamper-evident record of submitted CIDs and reviewer decisions.
+- **Who decides a report is verified?** The contract’s three configured reviewer wallets; two approve votes verify, and two reject votes reject.
+- **Does it detect or block attackers by itself?** No. Reports are submitted by people in this prototype. A separate consuming login service could read verified intelligence and apply its own rules.
+- **Is this already a public DApp?** The demonstrated version uses a local blockchain and the presenter’s IPFS node. Other people cannot rely on it being available over the public internet yet.
 
-```powershell
-cd blockchain
-npx hardhat keystore set SEPOLIA_RPC_URL
-npx hardhat keystore set SEPOLIA_PRIVATE_KEY
-```
+## Older prototype features
 
-The Ignition module `ThreatReportRegistryAdminModule` requires an `adminAddress` parameter (the wallet that will control audit statuses — typically your MetaMask account). Create `blockchain/ignition/params/11155111.json`:
+The dashboard also contains earlier MongoDB, demo-login, alert, restriction, and V1 registry features. They are separate legacy/demo flows and are not the source of truth for the V2 decentralized report-review demonstration. For the class presentation, focus on **V2 registry** and **Decentralized reports**.
 
-```json
-{
-  "ThreatReportRegistryAdminModule": {
-    "adminAddress": "0xYourMetaMaskAddress"
-  }
-}
-```
+## Project folders
 
-Then deploy, passing the parameters file you just created:
-
-```powershell
-npx hardhat ignition deploy ignition/modules/ThreatReportRegistry.ts --network sepolia --parameters ignition/params/11155111.json
-```
-
-### Verifying on Sepolia without exposing keys
-
-- The contract address and all reads are public — check `reportCount()`, `admin()`, and `getReport(id)` on `https://sepolia.etherscan.io/address/0xEdAC7D121D5bacA455735CF8c7C309D243B9B1a8`.
-- Without an explorer API key, you can still inspect the public contract details, transactions, and events on `https://sepolia.etherscan.io/address/0xEdAC7D121D5bacA455735CF8c7C309D243B9B1a8` — but source-code verification requires a separately configured verification method (for example, a block-explorer API key set up for Hardhat, or manual verification through the explorer's UI). `SEPOLIA_PRIVATE_KEY` is a deployment key, not a verification key, and must not be used for verification.
-
-- Never paste your private key into chat, tickets, or committed files. If a key is ever exposed, move funds and generate a new wallet immediately.
-
-## What must stay private vs. what is safe to share
-
-**Keep private (never commit or share):**
-
-- `backend/.env` — especially `MONGODB_URI` (may contain DB credentials)
-- `SEPOLIA_PRIVATE_KEY` keystore entry and any raw private key or seed phrase
-- `SEPOLIA_RPC_URL` if your provider URL embeds an API key
-- The Hardhat keystore files themselves
-
-**Safe to share:**
-
-- Contract addresses, chain IDs, RPC endpoints without embedded keys, deployment block numbers
-- `ignition/params/*.json` `adminAddress` values (public wallet addresses)
-- `backend/.env.example`, `package.json` files, and all source code
-- Transaction hashes and on-chain report IDs
-
-## Project layout
-
-```
-backend/     Express API + MongoDB (reports, alerts, demo restrictions, demo login)
-frontend/    Next.js dashboard + MetaMask/ethers on-chain integration
-blockchain/  Hardhat project: contracts/, ignition/ modules + params + deployments
+```text
+frontend/    Next.js dashboard and MetaMask integration
+backend/     Express API, MongoDB-backed legacy demo routes, and local IPFS upload endpoint
+blockchain/  Hardhat contracts, including ThreatReportRegistryV2
 ```

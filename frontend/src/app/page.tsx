@@ -11,6 +11,9 @@ const LOGIN_UNLOCK_API_URL = "http://localhost:3001/api/login-security/unlock";
 const ADMIN_SESSION_API_URL = "http://localhost:3001/api/admin/session";
 const ADMIN_LOGIN_API_URL = "http://localhost:3001/api/admin/login";
 const ADMIN_LOGOUT_API_URL = "http://localhost:3001/api/admin/logout";
+const IPFS_ADD_REPORT_API_URL = "http://localhost:3001/api/ipfs/add-report";
+const KUBO_GATEWAY_URL = "http://127.0.0.1:8080/ipfs/";
+const V2_REGISTRY_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const HARDHAT_CHAIN_ID = 31337;
 const SEPOLIA_CHAIN_ID = 11155111;
 
@@ -73,6 +76,22 @@ const REGISTRY_ABI = [
   "function getReport(uint256 reportId) view returns (tuple(bytes32 reportHash, uint256 submittedAt, address submitter, uint8 auditStatus) report)",
   "event ReportSubmitted(uint256 indexed reportId, bytes32 indexed reportHash, address indexed submitter, uint256 submittedAt)",
 ] as const;
+
+const V2_REGISTRY_ABI = [
+  "function reportCount() view returns (uint256)",
+  "function submitReport(string ipfsCid)",
+  "function getReport(uint256 reportId) view returns (tuple(string ipfsCid, address submitter, uint256 submittedAt, uint8 status) report)",
+  "function isReviewer(address account) view returns (bool)",
+  "function vote(uint256 reportId, bool approve)",
+  "function getVote(uint256 reportId, address reviewer) view returns (tuple(bool approve, bool cast) voteRecord)",
+  "function getVoteCounts(uint256 reportId) view returns (uint256 approves, uint256 rejects)",
+  "event ReportSubmitted(uint256 indexed reportId, string ipfsCid, address indexed submitter, uint256 submittedAt)",
+] as const;
+const V2_STATUS_LABELS: Record<number, string> = {
+  0: "Submitted",
+  1: "Verified",
+  2: "Rejected",
+};
 const AUDIT_STATUSES = ["Submitted", "UnderReview", "Verified", "Rejected"] as const;
 const AUDIT_STATUS_LABELS: Record<number, string> = {
   0: "Submitted",
@@ -113,6 +132,25 @@ type ReportPayload = {
   reports?: unknown;
   total?: unknown;
   error?: unknown;
+};
+
+type V2ReportEntry = {
+  reportId: string;
+  ipfsCid: string;
+  submitter: string;
+  submittedAt: number;
+  status: number;
+  approveCount: number;
+  rejectCount: number;
+  myVoteCast: boolean;
+  myVoteApprove: boolean;
+  ipfs?: {
+    ipAddress?: string;
+    threatType?: string;
+    summary?: string;
+    submittedAt?: string;
+  };
+  ipfsError?: string;
 };
 
 type ThreatAlert = {
@@ -252,6 +290,8 @@ export default function Home() {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitSuccess, setSubmitSuccess] = useState<string | null>(null);
+  const [decentralizedBusy, setDecentralizedBusy] = useState(false);
+  const [decentralizedFeedback, setDecentralizedFeedback] = useState<{ kind: "success" | "error"; message: string; cid?: string; txHash?: string } | null>(null);
   const [ipAddress, setIpAddress] = useState("");
   const [threatType, setThreatType] = useState<(typeof THREAT_TYPES)[number]>(THREAT_TYPES[0]);
   const [summary, setSummary] = useState("");
@@ -284,6 +324,12 @@ export default function Home() {
   const [anchoredIncidents, setAnchoredIncidents] = useState<Record<string, { reportId: string; txHash: string }>>({});
   const [adminStatus, setAdminStatus] = useState<"checking" | "authenticated" | "unauthenticated">("checking");
   const [adminBusy, setAdminBusy] = useState(false);
+  const [v2Reports, setV2Reports] = useState<V2ReportEntry[]>([]);
+  const [v2ReportsLoading, setV2ReportsLoading] = useState(false);
+  const [v2ReportsError, setV2ReportsError] = useState<string | null>(null);
+  const [v2IsReviewer, setV2IsReviewer] = useState(false);
+  const [v2VoteBusyId, setV2VoteBusyId] = useState<string | null>(null);
+  const [v2VoteFeedback, setV2VoteFeedback] = useState<Record<string, { kind: "success" | "error"; message: string }>>({});
 
   const loadReports = useCallback(async () => {
     setReportsLoading(true);
@@ -514,7 +560,12 @@ export default function Home() {
     setRegistryError(null);
     try {
       const provider = new BrowserProvider(ethereum);
-      const contract = new Contract(network.registryAddress, REGISTRY_ABI, provider);
+      const isV2 = walletChainId === HARDHAT_CHAIN_ID;
+      const contract = new Contract(
+        isV2 ? V2_REGISTRY_ADDRESS : network.registryAddress,
+        isV2 ? V2_REGISTRY_ABI : REGISTRY_ABI,
+        provider
+      );
       const count = (await contract.reportCount()) as bigint;
       setRegistryCount(count.toString());
     } catch (error) {
@@ -528,6 +579,114 @@ export default function Home() {
   useEffect(() => {
     void loadRegistryCount();
   }, [loadRegistryCount]);
+
+  const loadV2Reports = useCallback(async () => {
+    const ethereum = getEthereum();
+    if (!ethereum || !walletAccount || walletChainId !== HARDHAT_CHAIN_ID) {
+      setV2Reports([]);
+      setV2ReportsError(null);
+      setV2IsReviewer(false);
+      return;
+    }
+
+    setV2ReportsLoading(true);
+    setV2ReportsError(null);
+    try {
+      const provider = new BrowserProvider(ethereum);
+      const contract = new Contract(V2_REGISTRY_ADDRESS, V2_REGISTRY_ABI, provider);
+      const count = Number((await contract.reportCount()) as bigint);
+      const reviewer = (await contract.isReviewer(walletAccount)) as boolean;
+      setV2IsReviewer(reviewer);
+
+      const entries: V2ReportEntry[] = [];
+      for (let reportId = 0; reportId < count; reportId += 1) {
+        const report = (await contract.getReport(reportId)) as {
+          ipfsCid: string;
+          submitter: string;
+          submittedAt: bigint;
+          status: number;
+        };
+        const counts = (await contract.getVoteCounts(reportId)) as { approves: bigint; rejects: bigint };
+        const myVote = (await contract.getVote(reportId, walletAccount)) as { approve: boolean; cast: boolean };
+        entries.push({
+          reportId: String(reportId),
+          ipfsCid: report.ipfsCid,
+          submitter: report.submitter,
+          submittedAt: Number(report.submittedAt),
+          status: Number(report.status),
+          approveCount: Number(counts.approves),
+          rejectCount: Number(counts.rejects),
+          myVoteCast: myVote.cast,
+          myVoteApprove: myVote.approve,
+        });
+      }
+
+      const withContent = await Promise.all(
+        entries.map(async (entry) => {
+          try {
+            const response = await fetch(`${KUBO_GATEWAY_URL}${entry.ipfsCid}`);
+            if (!response.ok) throw new Error(`Gateway returned ${response.status}`);
+            const data = (await response.json()) as V2ReportEntry["ipfs"];
+            return { ...entry, ipfs: data };
+          } catch (error) {
+            return {
+              ...entry,
+              ipfsError: error instanceof Error ? error.message : "IPFS fetch failed",
+            };
+          }
+        })
+      );
+
+      setV2Reports(withContent);
+    } catch (error) {
+      setV2Reports([]);
+      setV2ReportsError(error instanceof Error ? error.message : "Unable to read V2 reports from the registry.");
+    } finally {
+      setV2ReportsLoading(false);
+    }
+  }, [walletAccount, walletChainId]);
+
+  useEffect(() => {
+    void loadV2Reports();
+  }, [loadV2Reports]);
+
+  async function handleV2Vote(entry: V2ReportEntry, approve: boolean) {
+    const ethereum = getEthereum();
+    if (!ethereum || !walletAccount) {
+      setV2VoteFeedback((current) => ({ ...current, [entry.reportId]: { kind: "error", message: "Connect your MetaMask wallet first." } }));
+      return;
+    }
+    if (walletChainId !== HARDHAT_CHAIN_ID) {
+      setV2VoteFeedback((current) => ({ ...current, [entry.reportId]: { kind: "error", message: "Switch MetaMask to Hardhat Local (chain ID 31337) to vote." } }));
+      return;
+    }
+
+    setV2VoteBusyId(entry.reportId);
+    setV2VoteFeedback((current) => {
+      const next = { ...current };
+      delete next[entry.reportId];
+      return next;
+    });
+    try {
+      const provider = new BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+      const contract = new Contract(V2_REGISTRY_ADDRESS, V2_REGISTRY_ABI, signer);
+      const tx = await contract.vote(BigInt(entry.reportId), approve);
+      await tx.wait();
+      setV2VoteFeedback((current) => ({ ...current, [entry.reportId]: { kind: "success", message: approve ? "Approve vote recorded." : "Reject vote recorded." } }));
+      await loadV2Reports();
+    } catch (error) {
+      const code = (error as { code?: number }).code;
+      const reason = code === 4001
+        ? "Transaction rejected in MetaMask."
+        : error instanceof Error
+          ? error.message
+          : "Vote transaction failed.";
+      setV2VoteFeedback((current) => ({ ...current, [entry.reportId]: { kind: "error", message: reason } }));
+    } finally {
+      setV2VoteBusyId(null);
+    }
+  }
 
   const loadAnchoredReports = useCallback(async () => {
     const ethereum = getEthereum();
@@ -908,6 +1067,92 @@ export default function Home() {
     }
   }
 
+  async function handleDecentralizedSubmit() {
+    setDecentralizedBusy(true);
+    setDecentralizedFeedback(null);
+    setSubmitError(null);
+    setSubmitSuccess(null);
+
+    if (!ipAddress.trim() || !summary.trim()) {
+      setDecentralizedFeedback({ kind: "error", message: "IP address and summary are required before submitting." });
+      setDecentralizedBusy(false);
+      return;
+    }
+
+    const reportPayload = {
+      ipAddress: ipAddress.trim(),
+      threatType,
+      summary: summary.trim(),
+      ...(evidence.trim() ? { evidence: evidence.trim() } : {}),
+      submittedAt: new Date().toISOString(),
+    };
+
+    let cid: string;
+    try {
+      const response = await fetch(IPFS_ADD_REPORT_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(reportPayload),
+      });
+      const payload = (await response.json()) as { cid?: unknown; error?: unknown };
+      if (!response.ok || typeof payload.cid !== "string" || payload.cid.length === 0) {
+        throw new Error(typeof payload.error === "string" ? payload.error : "IPFS upload failed.");
+      }
+      cid = payload.cid;
+    } catch (error) {
+      setDecentralizedFeedback({ kind: "error", message: error instanceof Error ? error.message : "IPFS upload failed." });
+      setDecentralizedBusy(false);
+      return;
+    }
+
+    const ethereum = getEthereum();
+    if (!ethereum) {
+      setDecentralizedFeedback({ kind: "error", message: `IPFS upload succeeded (CID: ${cid}) but MetaMask is not installed.`, cid });
+      setDecentralizedBusy(false);
+      return;
+    }
+
+    try {
+      const provider = new BrowserProvider(ethereum);
+      const network = await provider.getNetwork();
+      if (Number(network.chainId) !== HARDHAT_CHAIN_ID) {
+        setDecentralizedFeedback({
+          kind: "error",
+          message: `IPFS upload succeeded (CID: ${cid}). Switch MetaMask to Hardhat Local (chain ID 31337) to submit on-chain.`,
+          cid,
+        });
+        setDecentralizedBusy(false);
+        return;
+      }
+
+      const signer = await provider.getSigner();
+      const contract = new Contract(V2_REGISTRY_ADDRESS, V2_REGISTRY_ABI, signer);
+      const tx = await contract.submitReport(cid);
+      const receipt = await tx.wait();
+
+      setDecentralizedFeedback({
+        kind: "success",
+        message: "Report anchored on the local V2 registry.",
+        cid,
+        txHash: typeof receipt?.hash === "string" ? receipt.hash : undefined,
+      });
+    } catch (error) {
+      const code = (error as { code?: number }).code;
+      const reason = code === 4001
+        ? "Transaction rejected in MetaMask."
+        : error instanceof Error
+          ? error.message
+          : "On-chain submission failed.";
+      setDecentralizedFeedback({
+        kind: "error",
+        message: `IPFS upload succeeded (CID: ${cid}), but on-chain submission failed: ${reason}`,
+        cid,
+      });
+    } finally {
+      setDecentralizedBusy(false);
+    }
+  }
+
   return (
     <main className="dashboard-shell">
       <aside className="sidebar">
@@ -1004,8 +1249,8 @@ export default function Home() {
           <section className="registry-section" aria-labelledby="registry-heading">
             <div className="section-heading">
               <div>
-                <div className="section-kicker">{activeNetwork ? `ON-CHAIN REGISTRY · ${activeNetwork.name.toUpperCase()} · CHAIN ${walletChainId}` : "ON-CHAIN REGISTRY · UNSUPPORTED NETWORK"}</div>
-                <h2 id="registry-heading">On-chain registry</h2>
+                <div className="section-kicker">{activeNetwork ? `${walletChainId === HARDHAT_CHAIN_ID ? "V2 REGISTRY" : "ON-CHAIN REGISTRY"} · ${activeNetwork.name.toUpperCase()} · CHAIN ${walletChainId}` : "ON-CHAIN REGISTRY · UNSUPPORTED NETWORK"}</div>
+                <h2 id="registry-heading">{walletChainId === HARDHAT_CHAIN_ID ? "V2 registry" : "On-chain registry"}</h2>
               </div>
               <div className="registry-header-actions">
                 <div className="network-switch" role="group" aria-label="Choose registry network">
@@ -1043,7 +1288,7 @@ export default function Home() {
                 <div className="registry-count-row">
                   <span className="registry-count-value">{registryCount}</span>
                   <span className="registry-count-label">reports recorded on-chain</span>
-                  <code className="registry-address">{activeNetwork.registryAddress}</code>
+                  <code className="registry-address">{walletChainId === HARDHAT_CHAIN_ID ? V2_REGISTRY_ADDRESS : activeNetwork.registryAddress}</code>
                 </div>
               )}
             </div>
@@ -1325,6 +1570,97 @@ export default function Home() {
               </div>
             </div>
           </section>
+
+          <section className="reports-section" aria-labelledby="v2-reports-heading">
+            <div className="section-heading">
+              <div><div className="section-kicker">V2 REGISTRY · HARDFHAT LOCAL · READ-ONLY</div><h2 id="v2-reports-heading">Decentralized reports</h2></div>
+              <span className="report-limit">ThreatReportRegistryV2</span>
+            </div>
+            <div className="table-card">
+              <div className="table-toolbar">
+                <div className="feed-label"><span className="feed-live-dot" /> V2 registry <span className="feed-divider">·</span> <span>{v2ReportsLoading ? "Loading" : `${v2Reports.length} loaded`}</span></div>
+                <button className="filter-button" onClick={() => void loadV2Reports()} disabled={v2ReportsLoading || !walletAccount || walletChainId !== HARDHAT_CHAIN_ID}>
+                  Refresh <span className="refresh-mark">↻</span>
+                </button>
+              </div>
+              {!walletAccount && <div className="report-state">Connect your MetaMask wallet on Hardhat Local (chain 31337) to read V2 reports.</div>}
+              {walletAccount && walletChainId !== HARDHAT_CHAIN_ID && (
+                <div className="report-state report-error" role="alert">
+                  <strong>Wrong network</strong><span>Switch MetaMask to Hardhat Local (chain ID 31337) to read the V2 registry.</span>
+                </div>
+              )}
+              {walletAccount && walletChainId === HARDHAT_CHAIN_ID && v2ReportsError && (
+                <div className="report-state report-error" role="alert">
+                  <strong>Could not load V2 reports</strong><span>{v2ReportsError}</span>
+                  <button className="retry-button" onClick={() => void loadV2Reports()}>Try again</button>
+                </div>
+              )}
+              {walletAccount && walletChainId === HARDHAT_CHAIN_ID && !v2ReportsError && v2ReportsLoading && <div className="report-state">Loading V2 reports…</div>}
+              {walletAccount && walletChainId === HARDHAT_CHAIN_ID && !v2ReportsError && !v2ReportsLoading && v2Reports.length === 0 && <div className="report-state">No reports on the V2 registry yet.</div>}
+              {walletAccount && walletChainId === HARDHAT_CHAIN_ID && !v2ReportsError && !v2ReportsLoading && v2Reports.length > 0 && (
+                <div className="table-scroll">
+                  <table>
+                    <thead><tr><th>REPORT</th><th>INDICATOR</th><th>CID</th><th>STATUS</th><th>VOTES</th><th>REVIEW</th><th>SUBMITTED ON-CHAIN</th><th>SUBMITTER</th></tr></thead>
+                    <tbody>
+                      {v2Reports.map((entry) => (
+                        <tr key={entry.reportId}>
+                          <td>
+                            <div className="report-title">{entry.ipfs?.threatType ?? "—"}</div>
+                            <div className="report-meta">{entry.ipfs?.summary ?? (entry.ipfsError ? "IPFS content unavailable" : "Loading content…")}</div>
+                            {entry.ipfsError && <div className="anchor-feedback anchor-feedback-error" role="alert">IPFS: {entry.ipfsError}</div>}
+                          </td>
+                          <td><code>{entry.ipfs?.ipAddress ?? "—"}</code></td>
+                          <td>
+                            <a className="v2-cid-link" href={`${KUBO_GATEWAY_URL}${entry.ipfsCid}`} target="_blank" rel="noreferrer" title={entry.ipfsCid}>
+                              <code>{entry.ipfsCid.slice(0, 12)}…{entry.ipfsCid.slice(-6)}</code>
+                            </a>
+                          </td>
+                          <td><span className="review-status"><i />{V2_STATUS_LABELS[entry.status] ?? `Status ${entry.status}`}</span></td>
+                          <td><code>{entry.approveCount}✓ / {entry.rejectCount}✗</code></td>
+                          <td>
+                            {entry.status !== 0 && <span className="audit-empty">Final</span>}
+                            {entry.status === 0 && !v2IsReviewer && <span className="audit-empty">Read-only</span>}
+                            {entry.status === 0 && v2IsReviewer && entry.myVoteCast && (
+                              <span className="audit-status-value">You voted: {entry.myVoteApprove ? "Approve" : "Reject"}</span>
+                            )}
+                            {entry.status === 0 && v2IsReviewer && !entry.myVoteCast && (
+                              <div className="alert-action audit-action">
+                                <button
+                                  className="mini-action-button"
+                                  onClick={() => void handleV2Vote(entry, true)}
+                                  disabled={v2VoteBusyId === entry.reportId}
+                                >
+                                  {v2VoteBusyId === entry.reportId ? "Voting…" : "Approve"}
+                                </button>
+                                <button
+                                  className="mini-action-button"
+                                  onClick={() => void handleV2Vote(entry, false)}
+                                  disabled={v2VoteBusyId === entry.reportId}
+                                >
+                                  {v2VoteBusyId === entry.reportId ? "Voting…" : "Reject"}
+                                </button>
+                              </div>
+                            )}
+                            {v2VoteFeedback[entry.reportId] && (
+                              <div className={`anchor-feedback anchor-feedback-${v2VoteFeedback[entry.reportId].kind}`} role={v2VoteFeedback[entry.reportId].kind === "error" ? "alert" : "status"}>
+                                {v2VoteFeedback[entry.reportId].message}
+                              </div>
+                            )}
+                          </td>
+                          <td><span className="reported-time"><Icon name="clock" size={14} />{formatReported(new Date(entry.submittedAt * 1000).toISOString())}</span></td>
+                          <td><code title={entry.submitter}>{shortenAddress(entry.submitter)}</code></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <div className="table-footer">
+                <span>Showing <strong>{v2Reports.length}</strong> V2 reports</span>
+                <span>Content fetched from local Kubo gateway · read-only</span>
+              </div>
+            </div>
+          </section>
           <footer className="page-footer"><span>ThreatIntelDApp <span className="footer-separator">·</span> Local demo dashboard</span><span>Local simulation only — real logins and traffic are never affected</span></footer>
         </div>
       </section>
@@ -1353,9 +1689,19 @@ export default function Home() {
               <textarea id="evidence" name="evidence" value={evidence} onChange={(event) => setEvidence(event.target.value)} maxLength={10_000} rows={4} placeholder="Add supporting text, if available" />
 
               {submitError && <div className="feedback-message feedback-error" role="alert">{submitError}</div>}
+              {decentralizedFeedback && (
+                <div className={`feedback-message ${decentralizedFeedback.kind === "success" ? "feedback-success" : "feedback-error"}`} role={decentralizedFeedback.kind === "error" ? "alert" : "status"}>
+                  {decentralizedFeedback.message}
+                  {decentralizedFeedback.cid && <div className="decentralized-detail">CID: <code>{decentralizedFeedback.cid}</code></div>}
+                  {decentralizedFeedback.txHash && <div className="decentralized-detail">Transaction: <code>{decentralizedFeedback.txHash}</code></div>}
+                </div>
+              )}
               <div className="form-actions">
-                <button type="button" className="cancel-button" onClick={() => setShowSubmitForm(false)} disabled={submitting}>Cancel</button>
-                <button type="submit" className="submit-button" disabled={submitting}>{submitting ? "Submitting…" : "Submit for review"}</button>
+                <button type="button" className="cancel-button" onClick={() => setShowSubmitForm(false)} disabled={submitting || decentralizedBusy}>Cancel</button>
+                <button type="submit" className="submit-button" disabled={submitting || decentralizedBusy}>{submitting ? "Submitting…" : "Submit for review"}</button>
+                <button type="button" className="submit-button decentralized-button" onClick={handleDecentralizedSubmit} disabled={submitting || decentralizedBusy}>
+                  {decentralizedBusy ? "Submitting…" : "Decentralized submit (IPFS + local chain)"}
+                </button>
               </div>
             </form>
           </section>

@@ -1,0 +1,49 @@
+{
+  "_format": "hh3-sol-build-info-1",
+  "id": "solc-0_8_34-6616ce5a2a8588386eb4f0938b4b1e6d6ca64963",
+  "solcVersion": "0.8.34",
+  "solcLongVersion": "0.8.34+commit.80d5c536",
+  "compilerType": "solc",
+  "toolVersions": {
+    "hardhat": "3.21.2"
+  },
+  "userSourceNameMap": {
+    "contracts/ThreatReportRegistryV2.sol": "project/contracts/ThreatReportRegistryV2.sol"
+  },
+  "input": {
+    "language": "Solidity",
+    "settings": {
+      "evmVersion": "osaka",
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "outputSelection": {
+        "*": {
+          "": [
+            "ast"
+          ],
+          "*": [
+            "abi",
+            "evm.bytecode.linkReferences",
+            "evm.bytecode.object",
+            "evm.bytecode.opcodes",
+            "evm.bytecode.sourceMap",
+            "evm.deployedBytecode.immutableReferences",
+            "evm.deployedBytecode.linkReferences",
+            "evm.deployedBytecode.object",
+            "evm.deployedBytecode.opcodes",
+            "evm.deployedBytecode.sourceMap",
+            "evm.methodIdentifiers"
+          ]
+        }
+      },
+      "remappings": []
+    },
+    "sources": {
+      "project/contracts/ThreatReportRegistryV2.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.34;\n\n/// @title ThreatReportRegistryV2\n/// @notice Stores IPFS CIDs for threat reports on-chain and lets 3 reviewers\n///         decide Verified/Rejected status by 2-of-3 voting.\n/// @dev Report content (IP addresses, summaries, evidence) stays on IPFS.\n///      Never store passwords, login attempts, personal evidence, or secrets here.\ncontract ThreatReportRegistryV2 {\n    /// @notice The review state of a submitted report.\n    enum ReviewStatus {\n        Submitted,\n        Verified,\n        Rejected\n    }\n\n    /// @notice The only report details stored in contract storage.\n    struct Report {\n        string ipfsCid;\n        address submitter;\n        uint256 submittedAt;\n        ReviewStatus status;\n    }\n\n    /// @notice A single reviewer's vote on a report.\n    struct Vote {\n        bool approve;\n        bool cast;\n    }\n\n    /// @notice The 3 wallets allowed to vote on reports.\n    address[3] public reviewers;\n\n    /// @notice Number of reports submitted so far; also the next report ID.\n    uint256 public reportCount;\n\n    // Report IDs start at zero and increase by one for each submission.\n    mapping(uint256 reportId => Report report) private reports;\n\n    // reportId => reviewer => vote\n    mapping(uint256 reportId => mapping(address reviewer => Vote vote)) private votes;\n\n    // Tally of votes per report.\n    mapping(uint256 reportId => uint256 approveCount) private approveCounts;\n    mapping(uint256 reportId => uint256 rejectCount) private rejectCounts;\n\n    /// @notice Emitted after a wallet submits an IPFS CID for a threat report.\n    event ReportSubmitted(\n        uint256 indexed reportId,\n        string ipfsCid,\n        address indexed submitter,\n        uint256 submittedAt\n    );\n\n    /// @notice Emitted when a reviewer casts an approve/reject vote.\n    event VoteCast(\n        uint256 indexed reportId,\n        address indexed reviewer,\n        bool approve\n    );\n\n    /// @notice Emitted when a report reaches a final Verified/Rejected status.\n    event ReportReviewed(\n        uint256 indexed reportId,\n        ReviewStatus status,\n        uint256 approveCount,\n        uint256 rejectCount\n    );\n\n    /// @notice Maximum allowed IPFS CID length in bytes.\n    uint256 public constant MAX_CID_LENGTH = 128;\n\n    error EmptyCid();\n    error CidTooLong(uint256 length);\n    error ReportNotFound(uint256 reportId);\n    error NotReviewer();\n    error AlreadyVoted(uint256 reportId);\n    error AlreadyFinal(uint256 reportId);\n    error SubmitterCannotVote(uint256 reportId);\n    error DuplicateReviewer();\n    error ZeroAddress();\n\n    /// @notice Sets the 3 distinct reviewer wallets. The deployer is not a reviewer\n    ///         unless explicitly included in the list.\n    /// @param reviewerA First reviewer wallet.\n    /// @param reviewerB Second reviewer wallet.\n    /// @param reviewerC Third reviewer wallet.\n    constructor(address reviewerA, address reviewerB, address reviewerC) {\n        if (reviewerA == address(0) || reviewerB == address(0) || reviewerC == address(0)) {\n            revert ZeroAddress();\n        }\n        if (reviewerA == reviewerB || reviewerA == reviewerC || reviewerB == reviewerC) {\n            revert DuplicateReviewer();\n        }\n\n        reviewers[0] = reviewerA;\n        reviewers[1] = reviewerB;\n        reviewers[2] = reviewerC;\n    }\n\n    /// @dev Restricts a function to the 3 reviewer wallets.\n    modifier onlyReviewer() {\n        if (!isReviewer(msg.sender)) revert NotReviewer();\n        _;\n    }\n\n    /// @notice Check whether a wallet is one of the 3 reviewers.\n    /// @param account The wallet to check.\n    /// @return True if the wallet is a reviewer.\n    function isReviewer(address account) public view returns (bool) {\n        return account == reviewers[0] || account == reviewers[1] || account == reviewers[2];\n    }\n\n    /// @notice Submit an IPFS CID for an off-chain threat report.\n    /// @param ipfsCid The IPFS CID of the report content.\n    /// @return reportId The numeric ID assigned to this report.\n    function submitReport(string calldata ipfsCid) external returns (uint256 reportId) {\n        uint256 cidLength = bytes(ipfsCid).length;\n        if (cidLength == 0) revert EmptyCid();\n        if (cidLength > MAX_CID_LENGTH) revert CidTooLong(cidLength);\n\n        reportId = reportCount;\n        reportCount += 1;\n\n        reports[reportId] = Report({\n            ipfsCid: ipfsCid,\n            submitter: msg.sender,\n            submittedAt: block.timestamp,\n            status: ReviewStatus.Submitted\n        });\n\n        emit ReportSubmitted(reportId, ipfsCid, msg.sender, block.timestamp);\n    }\n\n    /// @notice Cast an approve or reject vote on a report. Each reviewer may vote\n    ///         once per report, and only while the report is still Submitted.\n    ///         2 approve votes set Verified; 2 reject votes set Rejected.\n    /// @param reportId The numeric ID returned when the report was submitted.\n    /// @param approve True to approve, false to reject.\n    function vote(uint256 reportId, bool approve) external onlyReviewer {\n        if (reportId >= reportCount) revert ReportNotFound(reportId);\n        if (reports[reportId].status != ReviewStatus.Submitted) revert AlreadyFinal(reportId);\n        if (reports[reportId].submitter == msg.sender) revert SubmitterCannotVote(reportId);\n        if (votes[reportId][msg.sender].cast) revert AlreadyVoted(reportId);\n\n        votes[reportId][msg.sender] = Vote({ approve: approve, cast: true });\n        if (approve) {\n            approveCounts[reportId] += 1;\n        } else {\n            rejectCounts[reportId] += 1;\n        }\n\n        emit VoteCast(reportId, msg.sender, approve);\n\n        uint256 approves = approveCounts[reportId];\n        uint256 rejects = rejectCounts[reportId];\n        if (approves >= 2 || rejects >= 2) {\n            ReviewStatus finalStatus = approves >= 2 ? ReviewStatus.Verified : ReviewStatus.Rejected;\n            reports[reportId].status = finalStatus;\n            emit ReportReviewed(reportId, finalStatus, approves, rejects);\n        }\n    }\n\n    /// @notice Read a report using its numeric ID.\n    /// @param reportId The numeric ID assigned at submission.\n    /// @return report The CID, submitter, timestamp, and review status.\n    function getReport(uint256 reportId) external view returns (Report memory report) {\n        if (reportId >= reportCount) revert ReportNotFound(reportId);\n        return reports[reportId];\n    }\n\n    /// @notice Read a reviewer's vote on a report.\n    /// @param reportId The numeric ID assigned at submission.\n    /// @param reviewer The reviewer wallet.\n    /// @return voteRecord Whether the reviewer voted and whether they approved.\n    function getVote(uint256 reportId, address reviewer) external view returns (Vote memory voteRecord) {\n        if (reportId >= reportCount) revert ReportNotFound(reportId);\n        return votes[reportId][reviewer];\n    }\n\n    /// @notice Read the approve/reject tally for a report.\n    /// @param reportId The numeric ID assigned at submission.\n    /// @return approves Number of approve votes cast.\n    /// @return rejects Number of reject votes cast.\n    function getVoteCounts(uint256 reportId) external view returns (uint256 approves, uint256 rejects) {\n        if (reportId >= reportCount) revert ReportNotFound(reportId);\n        return (approveCounts[reportId], rejectCounts[reportId]);\n    }\n}\n"
+      }
+    }
+  }
+}

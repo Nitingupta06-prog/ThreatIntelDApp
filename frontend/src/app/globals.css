@@ -450,3 +450,13 @@ td code { padding: 4px 6px; border-radius: 3px; background: #f4f2ec; color: #4e4
   .admin-inline-actions .admin-login-button,
   .admin-inline-actions .cancel-button { flex: 1 1 auto; }
 }
+
+.decentralized-detail { margin-top: 6px; font-size: 11px; line-height: 1.5; word-break: break-all; }
+.decentralized-detail code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.v2-cid-link { color: inherit; text-decoration: none; }
+.v2-cid-link:hover code { color: var(--khaki-dark); text-decoration: underline; }
+.decentralized-button { border-color: var(--khaki-dark); background: var(--khaki); color: var(--ink); }
+.decentralized-button:hover:not(:disabled) { background: var(--khaki-dark); color: var(--surface); }
+@media (max-width: 560px) {
+  .form-actions .decentralized-button { flex: 1 1 100%; }
+}
